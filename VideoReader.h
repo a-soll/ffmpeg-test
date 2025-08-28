@@ -2,30 +2,35 @@
 #define VIDEOREADER_H
 
 #include <CoreMedia/CoreMedia.h>
+#include <functional>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 }
 
 class VideoReader {
 public:
+    using reader_callback = std::function<void(CMSampleBufferRef)>;
+
     VideoReader() {}
 
     ~VideoReader() {
         this->_teardown();
     }
 
-    void start(const char *url);
+    void start(const char *url, reader_callback callback);
 
-    /**
-     * buffer that can be handed to AVSampleBufferDisplayLayer
-     */
-    CMSampleBufferRef buffer = nullptr;
+    inline void stop() {
+        this->_stop = true;
+    }
 
 private:
-    void _handle_video_stream();
-    void _handle_audio_stream();
+    void _prepare_video_stream();
+    void _prepare_audio_stream();
+    void _send_audio_packet();
     void _send_video_packet();
     void _create_pixel_buffer();
 
@@ -38,7 +43,11 @@ private:
         if (this->_codec_ctx) {
             avcodec_free_context(&this->_codec_ctx);
         }
-        CFRelease(buffer);
+        if (this->_audio_ctx) {
+            avcodec_free_context(&this->_audio_ctx);
+        }
+        sws_freeContext(this->_sws_ctx);
+        swr_free(&this->_swr_ctx);
     }
 
     inline void _alloc_items() {
@@ -63,8 +72,11 @@ private:
     AVFormatContext *_format_ctx = nullptr;
     AVInputFormat *_input_format = nullptr;
     AVCodecContext *_codec_ctx   = nullptr;
+    AVCodecContext *_audio_ctx   = nullptr;
+    struct SwsContext *_sws_ctx  = nullptr;
+    struct SwrContext *_swr_ctx  = nullptr;
     bool _stop                   = false;
-    int _num_processed           = 0;
+    reader_callback _callback;
 };
 
 #endif /* VIDEOREADER_H */

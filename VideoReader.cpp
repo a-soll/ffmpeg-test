@@ -10,9 +10,6 @@ static void print_dimensions(AVStream *stream) {
 void VideoReader::_create_pixel_buffer() {
     CVPixelBufferRef pixel_buffer =
         reinterpret_cast<CVPixelBufferRef>(this->_frame->data[3]);
-    if (pixel_buffer) {
-        CFShow(pixel_buffer);
-    }
     CMVideoFormatDescriptionRef desc = nullptr;
     CMVideoFormatDescriptionCreateForImageBuffer(
         kCFAllocatorDefault, pixel_buffer, &desc
@@ -24,29 +21,25 @@ void VideoReader::_create_pixel_buffer() {
     double frame_duration_seconds = this->_frame->duration *
                                     av_q2d(this->_stream->time_base);
     CMSampleTimingInfo timing;
-    timing.duration = CMTimeMakeWithSeconds(frame_duration_seconds, 1000000000);
+    timing.duration        = CMTimeMakeWithSeconds(frame_duration_seconds, 1000000000);
+    timing.decodeTimeStamp = kCMTimeInvalid;
 
+    CMSampleBufferRef buffer;
     CMSampleBufferCreateForImageBuffer(
-        kCFAllocatorDefault,
-        pixel_buffer,
-        true,
-        nullptr,
-        nullptr,
-        desc,
-        &timing,
-        &this->buffer
+        kCFAllocatorDefault, pixel_buffer, true, nullptr, nullptr, desc, &timing, &buffer
     );
+    this->_callback(buffer);
     CFRelease(desc);
 }
 
 /**
  * setup video parameters
  */
-void VideoReader::_handle_video_stream() {
-    AVCodec *codec =
-        const_cast<AVCodec *>(avcodec_find_decoder(this->_stream->codecpar->codec_id));
+void VideoReader::_prepare_video_stream() {
+    const AVCodec *codec = avcodec_find_decoder(this->_stream->codecpar->codec_id);
     if (!codec) {
         std::cerr << "No decoder for codec\n";
+        return;
     }
     if (!this->_codec_ctx) {
         this->_codec_ctx                = avcodec_alloc_context3(codec);
@@ -71,10 +64,139 @@ void VideoReader::_handle_video_stream() {
     }
 }
 
+void VideoReader::_prepare_audio_stream() {
+    const AVCodec *codec = avcodec_find_decoder(this->_stream->codecpar->codec_id);
+    if (!codec) {
+        std::cerr << "No audio decoder found\n";
+        return;
+    }
+    if (!this->_audio_ctx) {
+        this->_audio_ctx = avcodec_alloc_context3(codec);
+        avcodec_parameters_to_context(this->_audio_ctx, this->_stream->codecpar);
+        if (avcodec_open2(this->_audio_ctx, codec, nullptr) < 0) {
+            std::cerr << "Failed to open audio codec\n";
+            avcodec_free_context(&this->_audio_ctx);
+            return;
+        }
+    }
+}
+
+void VideoReader::_send_audio_packet() {
+    int ret = avcodec_send_packet(this->_audio_ctx, this->_packet);
+
+    if (ret < 0) {
+        std::cerr << "Error sending audio packet\n";
+    }
+    AVChannelLayout out_ch_layout;
+    av_channel_layout_default(&out_ch_layout, this->_audio_ctx->ch_layout.nb_channels);
+    AVSampleFormat out_fmt = AV_SAMPLE_FMT_FLT;
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(this->_audio_ctx, this->_frame);
+
+        if (!this->_swr_ctx) {
+
+            swr_alloc_set_opts2(
+                &this->_swr_ctx,
+                &out_ch_layout,
+                out_fmt,
+                this->_audio_ctx->sample_rate,
+                &this->_audio_ctx->ch_layout,
+                this->_audio_ctx->sample_fmt,
+                this->_audio_ctx->sample_rate,
+                0,
+                nullptr
+            );
+            swr_init(this->_swr_ctx);
+        }
+
+        AudioStreamBasicDescription asbd;
+        asbd.mSampleRate       = this->_audio_ctx->sample_rate;
+        asbd.mFormatID         = kAudioFormatLinearPCM;
+        asbd.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        asbd.mChannelsPerFrame = out_ch_layout.nb_channels;
+        asbd.mBytesPerFrame    = sizeof(float) * asbd.mChannelsPerFrame;
+        asbd.mBytesPerPacket   = asbd.mBytesPerFrame;
+        asbd.mFramesPerPacket  = 1;
+        asbd.mBitsPerChannel   = 32;
+        asbd.mReserved         = 0;
+
+        uint8_t **output       = nullptr;
+        int output_linesize    = 0;
+        av_samples_alloc_array_and_samples(
+            &output,
+            &output_linesize,
+            out_ch_layout.nb_channels,
+            this->_frame->nb_samples,
+            out_fmt,
+            0
+        );
+
+        int converted_samples = swr_convert(
+            this->_swr_ctx,
+            &output[0],
+            this->_frame->nb_samples,
+            this->_frame->extended_data,
+            this->_frame->nb_samples
+        );
+        if (converted_samples <= 0) {
+            std::cout << "No converted audio samples\n";
+            return;
+        }
+
+        CMAudioFormatDescriptionRef audio_format = nullptr;
+        OSStatus status                          = CMAudioFormatDescriptionCreate(
+            kCFAllocatorDefault, &asbd, 0, nullptr, 0, nullptr, nullptr, &audio_format
+        );
+
+        CMBlockBufferRef block_buffer = nullptr;
+        CMBlockBufferCustomBlockSource custom_source;
+        custom_source.version   = 0;
+        custom_source.FreeBlock = [](void *refcon, void *memory_block, size_t size) {
+            uint8_t **output = (uint8_t **)refcon;
+            av_freep(&output[0]);
+            av_freep(&output);
+        };
+        custom_source.refCon = output;
+
+        status               = CMBlockBufferCreateWithMemoryBlock(
+            kCFAllocatorDefault,
+            output[0],
+            converted_samples * asbd.mBytesPerFrame,
+            kCFAllocatorDefault,
+            &custom_source,
+            0,
+            converted_samples * asbd.mBytesPerFrame,
+            0,
+            &block_buffer
+        );
+
+        CMTime pts = CMTimeMake(this->_frame->pts, this->_audio_ctx->sample_rate);
+        CMSampleTimingInfo timing;
+        timing.duration                = CMTimeMake(converted_samples, asbd.mSampleRate);
+        timing.decodeTimeStamp         = kCMTimeInvalid;
+        timing.presentationTimeStamp   = pts;
+
+        CMSampleBufferRef audio_buffer = nullptr;
+        CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            kCFAllocatorDefault,
+            block_buffer,
+            audio_format,
+            converted_samples,
+            pts,
+            nullptr,
+            &audio_buffer
+        );
+        this->_callback(audio_buffer);
+        CFRelease(block_buffer);
+        CFRelease(audio_format);
+    }
+}
+
 void VideoReader::_send_video_packet() {
     int ret = avcodec_send_packet(this->_codec_ctx, this->_packet);
     if (ret < 0) {
-        std::cerr << "Error sending packet\n";
+        std::cerr << "Error sending video packet\n";
+        return;
     }
 
     if (this->_frame->flags & AV_FRAME_FLAG_CORRUPT) {
@@ -102,19 +224,21 @@ void VideoReader::_send_video_packet() {
          * need to normalize pts, but for now exit.
          */
         if (this->_frame->pts < this->_last_pts) {
+            std::cout << "Ads ended?\n";
             exit(1);
         }
         this->_last_pts      = this->_frame->pts;
         AVPixelFormat format = static_cast<AVPixelFormat>(this->_frame->format);
         if (format == AV_PIX_FMT_VIDEOTOOLBOX) {
-            std::cout << "Format is VideoToolbox\n";
+            this->_create_pixel_buffer();
         } else {
             std::cout << "Format: " << format << '\n';
         }
     }
 }
 
-void VideoReader::start(const char *url) {
+void VideoReader::start(const char *url, reader_callback callback) {
+    this->_callback = callback;
     avformat_network_init();
     avformat_open_input(&this->_format_ctx, url, this->_input_format, nullptr);
 
@@ -129,9 +253,10 @@ void VideoReader::start(const char *url) {
         if (this->_stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             this->_video_stream_index = i;
             print_dimensions(this->_stream);
-            this->_handle_video_stream();
+            this->_prepare_video_stream();
         } else if (this->_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             this->_audio_stream_index = i;
+            this->_prepare_audio_stream();
         }
     }
 
@@ -143,15 +268,15 @@ void VideoReader::start(const char *url) {
 
         if (this->_packet->stream_index == this->_video_stream_index) {
             this->_send_video_packet();
+        } else if (this->_packet->stream_index == this->_audio_stream_index) {
+            this->_send_audio_packet();
         }
+
+        av_packet_unref(this->_packet);
 
         if (ret < 0) {
             std::cerr << "Failed to open input\n";
             return;
-        }
-        this->_num_processed++;
-        if (this->_num_processed == 20) {
-            this->_stop = true;
         }
     }
 }

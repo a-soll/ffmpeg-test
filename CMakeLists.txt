@@ -17,5 +17,8 @@ include_directories(
 
 find_library(AVFORMAT_LIBRARY avformat)
 find_library(AVUTIL_LIBRARY avutil)
+find_library(AVSWSCALE_LIBRARY swscale)
+find_library(AVSWRESAMPLE_LIBRARY swresample)
 
-target_link_libraries(test PUBLIC ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreFoundation")
+
+target_link_libraries(test PUBLIC ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} ${AVSWSCALE_LIBRARY} ${AVSWRESAMPLE_LIBRARY} "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreFoundation")
